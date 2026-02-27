@@ -33,7 +33,7 @@ class AttentionBlock(torch.nn.Module):
         self.query = Query(sim_dim,atte_dim)
         self.key = Key(smi_dim,atte_dim)
         self.value = Value(smi_dim,atte_dim)
-        self.scale = torch.sqrt(torch.FloatTensor([atte_dim])).float()
+        self.register_buffer('scale', torch.sqrt(torch.FloatTensor([atte_dim])).float())
         self.dropout = nn.Dropout(p=0.5)
     def forward(self,sim_emb,smi_emb):
         sim_Q = self.query(sim_emb)
@@ -42,7 +42,7 @@ class AttentionBlock(torch.nn.Module):
 
         smi_V = self.value(smi_emb)
 
-        m = torch.matmul(sim_Q,smi_K.T).float()
+        m = torch.matmul(sim_Q,smi_K.transpose(-2,-1)).float()
 
         m = m/self.scale.float()
         attention = torch.softmax(m, dim=-1)
@@ -73,10 +73,9 @@ class MultiHeadAttentionBlock(torch.nn.Module):
             smi_atte_emb, attention = h(sim_emb,smi_emb)
             # print(attention.shape)
             a_emb.append(smi_atte_emb)
-            attention = attention.detach().numpy()
-            attentions.append([attention])
+            attentions.append(attention)
         a_heads_emb = torch.cat(a_emb,dim=-1)
         smile_emb = self.fc(a_heads_emb)
-        attention_ave = np.mean(attentions,axis=0)
+        attention_ave = torch.stack(attentions).mean(dim=0)
         # print(attention_ave[0].shape)
         return smile_emb,attention_ave

@@ -1,8 +1,7 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv,GATConv,SAGPooling
-from torch_geometric.nn import global_mean_pool as gap, global_max_pool as gmp
 from MultiHeadAttention import *
 # device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -50,7 +49,7 @@ def PositionalEncoding(num_hiddens, max_len,embedding):
         -1, 1) / torch.pow(max_len, torch.arange(0, num_hiddens, 2, dtype=torch.float32) / num_hiddens)
     P[:, 0::2] = torch.sin(X)
     P[:, 1::2] = torch.cos(X)
-    embedding = embedding + P[:embedding.shape[0], :]
+    embedding = embedding + P[:embedding.shape[-2], :].to(embedding.device)
     return embedding
 
 class cnn_selfatte_encoder1(torch.nn.Module):
@@ -81,54 +80,28 @@ class cnn_selfatte_encoder1(torch.nn.Module):
         self.attention = MultiHeadAttentionBlock(self.smi_dim, self.smi_dim, self.atte_dim, self.atte_heads)
 
     def forward(self, output):
+        device = next(self.parameters()).device
 
-        embdding_all = []
-        data = output
-        ids = len(data)
-        for i in range(ids):
+        # Encode all SMILES to integer indices, pad/truncate to length 100: (N, 100)
+        encoded = np.stack([label_smiles(s, CHARISOSMISET, 100) for s in output])
+        drugstr_batch = torch.from_numpy(encoded).to(device)
 
-            drugstr = data[i]
-            # print(drugstr)
-            l = len(drugstr)
-            # print(l)
-            drugstr = torch.from_numpy(label_smiles(drugstr, CHARISOSMISET, l))
-            drug_embed = self.drug_embed(drugstr)
-            # print(drug_embed.shape)
-            # print("?????????????")
+        # Embedding: (N, 100, 64)
+        drug_embed = self.drug_embed(drugstr_batch)
 
-            drug_embed = PositionalEncoding(64,l,drug_embed)
-            # print(drug_embed.shape)
-            # print("?????????????")
-            drug_embed, atte = self.attention(drug_embed, drug_embed)
-            # print(drug_embed.shape)
-            if l >= 100:
-                drug_embed = drug_embed[:100]
-            else:
-                temp = np.zeros((100 - l, 64))
-                temp = torch.tensor(temp).long()
-                drug_embed = torch.cat((drug_embed, temp), dim=0)
-            # print(drug_embed.shape)
+        # Positional encoding: (N, 100, 64)
+        drug_embed = PositionalEncoding(64, 100, drug_embed)
 
-            drug_embed = drug_embed.unsqueeze(0)
-            # print(drug_embed.shape)
-            drug_embed = drug_embed.permute(0, 2, 1)
-            cnn_embedding = self.Drug_CNNs(drug_embed)
-            # print(cnn_embedding.shape)
-            cnn_embedding = cnn_embedding.permute(0, 2, 1)
-            # print(cnn_embedding.shape)
-            # print("?????????????????????????")
-            cnn_embedding = cnn_embedding.squeeze(0)
-            # print(cnn_embedding.shape)
-            # print("?????????????????????????")
-            batch = np.zeros((cnn_embedding.shape[0],cnn_embedding.shape[1]))
-            batch = torch.tensor(batch).long()
-            cnn_embedding = gmp(cnn_embedding,batch)
+        # Self-attention: (N, 100, 64)
+        drug_embed, atte = self.attention(drug_embed, drug_embed)
 
-            # cnn_embedding = self.Drug_max_pool(cnn_embedding).squeeze(2)
-            # print(cnn_embedding.shape)
-            # print("{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{")
-            embdding_all.append(cnn_embedding)
-        modular_feature = torch.cat(tuple(embdding_all))
-        # modular_feature = nn.Dropout(0.3)(modular_feature)
-        # modular_feature,atte = self.attention(modular_feature,modular_feature)
+        # Permute for CNN: (N, 64, 100)
+        drug_embed = drug_embed.permute(0, 2, 1)
+
+        # CNN: (N, 160, 85)
+        cnn_embedding = self.Drug_CNNs(drug_embed.float())
+
+        # Global max pool over sequence dim: (N, 160)
+        modular_feature = cnn_embedding.max(dim=-1).values
+
         return modular_feature

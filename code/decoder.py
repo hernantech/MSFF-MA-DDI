@@ -1,9 +1,5 @@
 import torch
 from torch import nn
-from keras import optimizers
-from keras.models import Sequential
-from keras.layers import Dense
-from keras.layers.core import Dropout, Activation
 class MlpDecoder(torch.nn.Module):
     """
     MLP decoder

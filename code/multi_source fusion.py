@@ -1,29 +1,19 @@
 import numpy as np
 import matplotlib
 import torch
+import torch.nn as nn
 matplotlib.use('agg')
 from sklearn.metrics import f1_score
 from sklearn.metrics import recall_score
 from sklearn.metrics import precision_score
-import matplotlib
-from tensorflow.python.keras.layers import Dropout, Activation
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_curve, auc,average_precision_score
 from sklearn.metrics import precision_recall_curve,roc_auc_score
 from sklearn.metrics import accuracy_score
-from tensorflow.keras import optimizers
-from tensorflow.python.keras.models import Sequential
-from tensorflow.python.keras.layers import Dense
-from tensorflow.python.keras.utils import np_utils
 from sklearn.preprocessing import label_binarize
-from torch_geometric.nn.models import GAE,InnerProductDecoder
-from keras.models import Model
-from keras.layers import Dense, Dropout, Input, Activation, BatchNormalization
-from keras.callbacks import EarlyStopping
 import os
 import pandas as pd
 from sklearn.model_selection import KFold
-os.environ['KERAS_BACKEND'] = 'tensorflow'
 from scipy.sparse import csr_matrix
 from model import *
 from utils import *
@@ -37,26 +27,72 @@ hid3 = 170
 droprate = 0.5
 event_num = 65
 node_feature = 548
-def DNN():
-    train_input = Input(shape=(1344,), name='Inputlayer')
-    train_in = Dense(512, activation='relu')(train_input)
-    train_in = BatchNormalization()(train_in)
-    train_in = Dropout(droprate)(train_in)
-    train_in = Dense(256, activation='relu')(train_in)
-    train_in = BatchNormalization()(train_in)
-    train_in = Dropout(droprate)(train_in)
-    train_in = Dense(event_num)(train_in)
-    out = Activation('softmax')(train_in)
-    model = Model(inputs=train_input, outputs=out)
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-    return model
+
+class DNN_Stage2(torch.nn.Module):
+    def __init__(self, input_dim, event_num, droprate=0.5):
+        super(DNN_Stage2, self).__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 512),
+            torch.nn.ReLU(),
+            torch.nn.BatchNorm1d(512),
+            torch.nn.Dropout(p=droprate),
+            torch.nn.Linear(512, 256),
+            torch.nn.ReLU(),
+            torch.nn.BatchNorm1d(256),
+            torch.nn.Dropout(p=droprate),
+            torch.nn.Linear(256, event_num),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def train_dnn(x_train, y_train, x_val, y_val, input_dim, event_num, droprate=0.5,
+              batch_size=68, epochs=100, patience=10):
+    dnn = DNN_Stage2(input_dim, event_num, droprate)
+    optimizer = torch.optim.Adam(dnn.parameters())
+    criterion = torch.nn.CrossEntropyLoss()
+    x_train_t = torch.tensor(x_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.long)
+    x_val_t = torch.tensor(x_val, dtype=torch.float32)
+    y_val_t = torch.tensor(y_val, dtype=torch.long)
+    best_val_loss = float('inf')
+    wait = 0
+    best_state = None
+    for epoch in range(epochs):
+        dnn.train()
+        perm = torch.randperm(x_train_t.size(0))
+        for i in range(0, x_train_t.size(0), batch_size):
+            idx = perm[i:i+batch_size]
+            out = dnn(x_train_t[idx])
+            loss = criterion(out, y_train_t[idx])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        dnn.eval()
+        with torch.no_grad():
+            val_out = dnn(x_val_t)
+            val_loss = criterion(val_out, y_val_t).item()
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            wait = 0
+            best_state = {k: v.clone() for k, v in dnn.state_dict().items()}
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+    if best_state is not None:
+        dnn.load_state_dict(best_state)
+    dnn.eval()
+    with torch.no_grad():
+        pred = torch.softmax(dnn(x_val_t), dim=1).numpy()
+    return pred
+
 def evaluate(pred_type, pred_score, y_test, event_num):
     all_eval_type = 6
     result_all = np.zeros((all_eval_type, 1), dtype=float)
     each_eval_type = 6
     result_eve = np.zeros((event_num, each_eval_type), dtype=float)
-    y_one_hot = label_binarize(y_test, np.arange(event_num))
-    pred_one_hot = label_binarize(pred_type, np.arange(event_num))
+    y_one_hot = label_binarize(y_test, classes=np.arange(event_num))
+    pred_one_hot = label_binarize(pred_type, classes=np.arange(event_num))
     result_all[0] = accuracy_score(y_test, pred_type)
     result_all[1] = roc_aupr_score(y_one_hot, pred_score, average='micro')
     result_all[2] = roc_auc_score(y_one_hot, pred_score, average='micro')
@@ -157,14 +193,16 @@ class Selfatte_Encoder(torch.nn.Module):
         super(Selfatte_Encoder, self).__init__()
         self.attention = self.attn = MultiHeadAttention(input_dim, n_heads)
     def forward(self, embedding):
-        modular_output = []
-        print(embedding.shape[0])
-        for i in range(embedding.shape[0]):
-            drugemb = embedding[i]
-            # print(drugemb)
-            out_drug= self.attention(drugemb)
-            modular_output.append(out_drug)
-        modular_feature = torch.cat(tuple(modular_output))
+        N = embedding.shape[0]
+        attn = self.attn
+        # Each drug is a single-token sequence; batch all 572 at once
+        X = embedding.unsqueeze(1)  # (N, 1, D)
+        Q = attn.W_Q(X).view(N, 1, attn.n_heads, attn.d_k).transpose(1, 2)  # (N, H, 1, d_k)
+        K = attn.W_K(X).view(N, 1, attn.n_heads, attn.d_k).transpose(1, 2)  # (N, H, 1, d_k)
+        V = attn.W_V(X).view(N, 1, attn.n_heads, attn.d_v).transpose(1, 2)  # (N, H, 1, d_v)
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(attn.d_k)   # (N, H, 1, 1)
+        context = torch.matmul(torch.nn.Softmax(dim=-1)(scores), V)          # (N, H, 1, d_v)
+        modular_feature = context.transpose(1, 2).reshape(N, attn.n_heads * attn.d_v)  # (N, H*d_v)
         return modular_feature
 
 class Encoder_decoder(torch.nn.Module):
@@ -237,10 +275,13 @@ simi_embedding = torch.tensor(simi_embedding, dtype=torch.float32)
 print(simi_embedding.shape)
 embedding = torch.cat((cnn_embedding,simi_embedding),dim=1)
 print(embedding.shape)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+embedding = embedding.to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-model = Encoder_decoder()
+model = Encoder_decoder().to(device)
 for fold in range(5):
     smiles,train_index,test_index,train_label,test_label,index_pair,label= prepare_data1(fold, num_cross_val)
+    train_label_t = torch.tensor(train_label, dtype=torch.long).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1500, gamma=0.1)
     for epoch in range(500):
@@ -249,11 +290,10 @@ for fold in range(5):
         optimizer.zero_grad()
         pred_score,encoder_embedding = model(embedding,train_index)
         l_pred_score = pred_score
-        pred_score = pred_score.detach().numpy()
+        pred_score = pred_score.detach().cpu().numpy()
         pred_type = np.argmax(pred_score, axis=1)
-        train_label = torch.LongTensor(train_label)
         criterion = nn.CrossEntropyLoss()
-        loss = criterion(l_pred_score, train_label)
+        loss = criterion(l_pred_score, train_label_t)
         loss.backward(retain_graph=True)
         optimizer.step()
         print(loss.tolist())
@@ -266,9 +306,9 @@ for fold in range(5):
         all_eval_type = 11
         result_all = np.zeros((all_eval_type, 1), dtype=float)
         y_test = y_true
-        y_one_hot = label_binarize(y_test, np.arange(65))
+        y_one_hot = label_binarize(y_test, classes=np.arange(65))
         # print(y_one_hot)
-        pred_one_hot = label_binarize(pred_type, np.arange(65))
+        pred_one_hot = label_binarize(pred_type, classes=np.arange(65))
         result_all[0] = accuracy_score(y_test, pred_type)
         result_all[1] = roc_aupr_score(y_one_hot, pred_score, average='micro')
         result_all[2] = roc_auc_score(y_one_hot, pred_score, average='micro')
@@ -280,9 +320,8 @@ for fold in range(5):
         model.eval()
         pred_score, encoder_embedding = model(embedding, test_index)
         l_pred_score = pred_score
-        pred_score = pred_score.detach().numpy()
+        pred_score = pred_score.detach().cpu().numpy()
         pred_type = np.argmax(pred_score, axis=1)
-        test_label = torch.LongTensor(test_label)
         y_true = np.array([])
         y_pred = np.array([])
         y_score = np.zeros((0, 65), dtype=float)
@@ -292,9 +331,9 @@ for fold in range(5):
         all_eval_type = 6
         result_all = np.zeros((all_eval_type, 1), dtype=float)
         y_test = y_true
-        y_one_hot = label_binarize(y_test, np.arange(65))
+        y_one_hot = label_binarize(y_test, classes=np.arange(65))
         # print(y_one_hot)
-        pred_one_hot = label_binarize(pred_type, np.arange(65))
+        pred_one_hot = label_binarize(pred_type, classes=np.arange(65))
         # print(pred_one_hot.shape)
         result_all[0] = accuracy_score(y_test, pred_type)
         result_all[1] = roc_aupr_score(y_one_hot, pred_score, average='micro')
@@ -308,7 +347,7 @@ for fold in range(5):
             max_auc = result_all[2]
             cnn_noatte_simi_embedding = embedding
             sequ_hete_embedding = embedding
-            sequ_hete_embedding = np.array(sequ_hete_embedding)
+            sequ_hete_embedding = sequ_hete_embedding.detach().cpu().numpy()
             np.savetxt("sequ_hete_embedding.txt", sequ_hete_embedding, fmt="%6.4f")
 
     print("Optimization Finished!")
@@ -331,26 +370,13 @@ for fold in range(5):
     train_index = np.where(index_all_class != fold)
     test_index = np.where(index_all_class == fold)
     pred = np.zeros((len(test_index[0]), event_num), dtype=float)
-    x_train = drug_data[train_index]
-    x_train = x_train.detach().numpy()
-    x_test = drug_data[test_index]
-    x_test = x_test.detach().numpy()
+    x_train = drug_data[train_index].detach().numpy()
+    x_test = drug_data[test_index].detach().numpy()
     y_train = label[train_index]
-    y_train_one_hot = np.array(y_train)
-    y_train_one_hot = (np.arange(y_train_one_hot.max() + 1) == y_train[:, None]).astype(dtype='float32')
     y_test = label[test_index]
-    # one-hot encoding
-    y_test_one_hot = np.array(y_test)
-    y_test_one_hot = (np.arange(y_test_one_hot.max() + 1) == y_test[:, None]).astype(dtype='float32')
-    print(type(x_train))
-    print(type(x_test))
-    print(type(y_train))
-    print(type(y_test))
-    dnn = DNN()
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=0, mode='auto')
-    dnn.fit(x_train, y_train_one_hot, batch_size=68, epochs=100, validation_data=(x_test, y_test_one_hot),
-            callbacks=[early_stopping])
-    pred += dnn.predict(x_test)
+    pred += train_dnn(x_train, y_train.astype(int), x_test, y_test.astype(int),
+                      input_dim=1344, event_num=event_num, droprate=droprate,
+                      batch_size=68, epochs=100, patience=10)
     pred_score = pred
     pred_type = np.argmax(pred_score, axis=1)
     y_true = np.hstack((y_true, y_test))
