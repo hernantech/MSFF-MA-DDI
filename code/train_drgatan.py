@@ -10,14 +10,11 @@ v2 changes (from Gemini discussion):
   ✓ Drug embeddings computed ONCE per batch via full-graph GNN pass
   ✓ --no-gnn flag for ablation (proves graph encoder matters)
   ✓ --focal flag to optionally use mild focal loss (γ=0.5)
+  ✓ TensorBoard logging (loss curves, metrics per fold, LR schedule)
 
 Usage:
     python train_drgatan.py [--epochs 200] [--folds 5] [--batch 512]
-
-    # Ablations
-    python train_drgatan.py --no-gnn               # without graph encoder
-    python train_drgatan.py --focal --gamma 0.5     # focal loss instead of CE
-    python train_drgatan.py --no-asym-reg           # without asymmetry regularization
+    tensorboard --logdir ../logs/tensorboard --bind_all
 """
 
 import os
@@ -27,6 +24,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,7 +63,31 @@ def get_args():
     p.add_argument('--gnn-layers',   type=int,   default=2)
     p.add_argument('--seed',         type=int,   default=42)
     p.add_argument('--save-dir',     default='../results/clifford_runs_v2')
+    p.add_argument('--tb-dir',       default='../logs/tensorboard',
+                   help='TensorBoard log directory')
+    p.add_argument('--run-name',     default=None,
+                   help='TensorBoard run name (auto-generated if not set)')
     return p.parse_args()
+
+
+def make_run_name(args):
+    """Generate a descriptive TensorBoard run name from args."""
+    if args.run_name:
+        return args.run_name
+    parts = ['v2']
+    if args.no_gnn:
+        parts.append('no-gnn')
+    else:
+        parts.append(f'gnn{args.gnn_layers}L{args.gnn_heads}H')
+    if args.focal:
+        parts.append(f'focal-g{args.gamma}')
+    else:
+        parts.append(f'ce-ls{args.label_smooth}')
+    parts.append(f'mv{args.num_mv}')
+    if args.no_asym_reg:
+        parts.append('no-asym')
+    parts.append(time.strftime('%m%d-%H%M'))
+    return '_'.join(parts)
 
 
 # ── Training step ──────────────────────────────────────────────────────────────
@@ -73,12 +95,7 @@ def get_args():
 def train_epoch(model, dataloader, drug_features, graph_edge_index,
                 optimizer, loss_fn, device, lambda_asym, use_asym_reg,
                 grad_clip=1.0):
-    """One training epoch with graph-aware encoding.
-
-    The GNN runs on the full graph (ALL drugs, TRAINING edges only) once per
-    batch to produce contextualized embeddings, then the decoder scores the
-    batch pairs.
-    """
+    """One training epoch with graph-aware encoding."""
     model.train()
     drug_features = drug_features.to(device)
     graph_edge_index = graph_edge_index.to(device)
@@ -89,10 +106,8 @@ def train_epoch(model, dataloader, drug_features, graph_edge_index,
         batch_edges  = batch_edges.to(device)
         batch_labels = batch_labels.to(device)
 
-        # Full-graph encoding (GNN sees all drugs + training edges)
         drug_emb = model.encode(drug_features, graph_edge_index)
 
-        # Slice pair embeddings from the global embedding table
         h_perp = drug_emb[batch_edges[:, 0]]
         h_vuln = drug_emb[batch_edges[:, 1]]
 
@@ -155,6 +170,16 @@ def main():
     device = torch.device(args.device)
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # TensorBoard
+    run_name = make_run_name(args)
+    tb_path = os.path.join(args.tb_dir, run_name)
+    os.makedirs(tb_path, exist_ok=True)
+    writer = SummaryWriter(log_dir=tb_path)
+    print(f'TensorBoard: {tb_path}')
+
+    # Log hyperparameters
+    writer.add_text('config', str(vars(args)))
+
     print(f'Device: {device}')
     print(f'Loading DRGATAN...')
     t0 = time.time()
@@ -179,6 +204,7 @@ def main():
     splits = make_cv_splits(edge_index, labels, n_splits=args.folds, seed=args.seed)
 
     fold_results = []
+    global_step = 0  # continuous step counter across folds
 
     for fold, (train_idx, test_idx) in enumerate(splits):
         print(f'\n{"="*60}')
@@ -248,9 +274,22 @@ def main():
                 loss_fn, device,
             )
             scheduler.step()
+            global_step += 1
+
+            lr_now = optimizer.param_groups[0]['lr']
+
+            # ── TensorBoard logging ────────────────────────────────────────
+            writer.add_scalars('loss/train_val', {
+                f'train/fold{fold+1}': train_loss,
+                f'val/fold{fold+1}': val_loss,
+            }, global_step)
+            writer.add_scalar(f'fold{fold+1}/loss/train', train_loss, epoch)
+            writer.add_scalar(f'fold{fold+1}/loss/val', val_loss, epoch)
+            writer.add_scalar(f'fold{fold+1}/loss/cls', cl, epoch)
+            writer.add_scalar(f'fold{fold+1}/loss/asym_reg', ar, epoch)
+            writer.add_scalar(f'fold{fold+1}/lr', lr_now, epoch)
 
             if epoch % 10 == 0 or epoch <= 5:
-                lr_now = optimizer.param_groups[0]['lr']
                 print(f'  Ep {epoch:3d}/{args.epochs}  '
                       f'train={train_loss:.4f}  (cl={cl:.4f} ar={ar:.4f})  '
                       f'val={val_loss:.4f}  lr={lr_now:.2e}  '
@@ -284,6 +323,14 @@ def main():
         print_metrics(metrics, prefix=f'[fold {fold+1}] ')
         fold_results.append(metrics)
 
+        # ── Log fold metrics to TensorBoard ────────────────────────────────
+        metric_keys = ['accuracy', 'auroc', 'aupr', 'f1', 'precision',
+                       'recall', 'direction_accuracy', 'asymmetry_score',
+                       'f1_dominant', 'f1_top4', 'f1_mid', 'f1_rare']
+        for key in metric_keys:
+            if key in metrics:
+                writer.add_scalar(f'test/{key}', metrics[key], fold + 1)
+
         # Save fold model
         ckpt_path = os.path.join(args.save_dir, f'fold{fold+1}_model.pt')
         torch.save({
@@ -311,16 +358,28 @@ def main():
             summary[key] = {'mean': np.mean(vals), 'std': np.std(vals)}
             print(f'  {key:<22}: {np.mean(vals):.4f} ± {np.std(vals):.4f}')
 
+    # Log final summary as hparams
+    hparam_dict = {
+        'lr': args.lr, 'batch': args.batch, 'enc_dim': args.enc_dim,
+        'num_mv': args.num_mv, 'gnn_layers': args.gnn_layers,
+        'gnn_heads': args.gnn_heads, 'label_smooth': args.label_smooth,
+        'use_gnn': not args.no_gnn, 'asym_reg': not args.no_asym_reg,
+        'focal': args.focal, 'gamma': args.gamma,
+    }
+    metric_dict = {f'hparam/{k}': v['mean'] for k, v in summary.items()}
+    writer.add_hparams(hparam_dict, metric_dict)
+
     # Save summary CSV
     import csv
     csv_path = os.path.join(args.save_dir, 'cv_summary.csv')
     with open(csv_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['metric', 'mean', 'std'])
+        w = csv.writer(f)
+        w.writerow(['metric', 'mean', 'std'])
         for key, stats in summary.items():
-            writer.writerow([key, f'{stats["mean"]:.6f}', f'{stats["std"]:.6f}'])
+            w.writerow([key, f'{stats["mean"]:.6f}', f'{stats["std"]:.6f}'])
     print(f'\nSummary saved to {csv_path}')
 
+    writer.close()
     return summary
 
 
