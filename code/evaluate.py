@@ -91,29 +91,31 @@ def evaluate_standard(
 @torch.no_grad()
 def direction_accuracy(
     model,
-    features:   torch.Tensor,
-    edge_index: torch.Tensor,
+    features:         torch.Tensor,
+    edge_index:       torch.Tensor,
+    graph_edge_index: torch.Tensor = None,
 ) -> float:
     """Fraction of pairs where pred(A→B) ≠ pred(B→A).
 
     A perfectly symmetric model scores 0.0.
     A model that has learned directional patterns scores closer to 1.0.
     """
-    result = model.predict_direction(features, edge_index)
+    result = model.predict_direction(features, edge_index, graph_edge_index)
     return result['direction_diff']
 
 
 @torch.no_grad()
 def asymmetry_score(
     model,
-    features:   torch.Tensor,
-    edge_index: torch.Tensor,
+    features:         torch.Tensor,
+    edge_index:       torch.Tensor,
+    graph_edge_index: torch.Tensor = None,
 ) -> float:
     """Mean absolute difference in predicted probabilities for (A→B) vs (B→A).
 
     Range [0, 1]. Higher = more directional predictions.
     """
-    drug_emb = model.encoder(features)
+    drug_emb = model.encode(features, graph_edge_index)
     h_A = drug_emb[edge_index[:, 0]]
     h_B = drug_emb[edge_index[:, 1]]
 
@@ -191,28 +193,29 @@ def per_type_f1(
 @torch.no_grad()
 def full_evaluation(
     model,
-    features:     torch.Tensor,
-    edge_index:   torch.Tensor,
-    labels:       torch.Tensor,
-    train_labels: np.ndarray,
-    num_classes:  int = 95,
-    batch_size:   int = 2048,
-    device:       str = 'cpu',
+    features:         torch.Tensor,
+    edge_index:       torch.Tensor,
+    labels:           torch.Tensor,
+    train_labels:     np.ndarray,
+    num_classes:      int = 95,
+    batch_size:       int = 2048,
+    device:           str = 'cpu',
+    graph_edge_index: torch.Tensor = None,
 ) -> dict:
     """Run the full evaluation suite on a test split.
 
-    Processes pairs in mini-batches to avoid OOM on large test sets.
+    graph_edge_index: (2, E) TRAINING edges for GNN (prevents test leakage).
 
-    Returns
-    -------
-    dict containing all standard + asymmetry metrics
+    Returns dict containing all standard + asymmetry metrics.
     """
     model.eval()
-    features    = features.to(device)
-    edge_index  = edge_index.to(device)
+    features   = features.to(device)
+    edge_index = edge_index.to(device)
+    if graph_edge_index is not None:
+        graph_edge_index = graph_edge_index.to(device)
 
-    # Encode all drugs once
-    drug_emb = model.encoder(features)
+    # Encode all drugs once (GNN uses training edges only)
+    drug_emb = model.encode(features, graph_edge_index)
 
     all_logits = []
     all_labels = []
@@ -227,21 +230,21 @@ def full_evaluation(
         all_logits.append(logits_b.cpu())
         all_labels.append(labels[start:end].cpu())
 
-    logits  = torch.cat(all_logits, dim=0)         # (N, C)
-    y_true  = torch.cat(all_labels, dim=0).numpy()
+    logits = torch.cat(all_logits, dim=0)
+    y_true = torch.cat(all_labels, dim=0).numpy()
 
-    y_score = F.softmax(logits, dim=-1).numpy()     # (N, C)
-    y_pred  = logits.argmax(dim=-1).numpy()         # (N,)
+    y_score = F.softmax(logits, dim=-1).numpy()
+    y_pred  = logits.argmax(dim=-1).numpy()
 
     std = evaluate_standard(y_true, y_pred, y_score, num_classes)
 
-    # Asymmetry metrics on a subset (full test can be large)
+    # Asymmetry metrics on a subset
     sample_size = min(N, 4096)
     idx_sample  = np.random.choice(N, sample_size, replace=False)
     ei_sample   = edge_index[idx_sample].to(device)
 
-    dir_acc  = direction_accuracy(model, features, ei_sample)
-    asym_sc  = asymmetry_score(model, features, ei_sample)
+    dir_acc  = direction_accuracy(model, features, ei_sample, graph_edge_index)
+    asym_sc  = asymmetry_score(model, features, ei_sample, graph_edge_index)
 
     type_f1 = per_type_f1(y_true, y_pred, train_labels, num_classes)
 

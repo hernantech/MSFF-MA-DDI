@@ -158,11 +158,11 @@ def compute_sample_weights(labels, num_classes):
 # ── DataLoader factory ─────────────────────────────────────────────────────────
 
 def make_dataloader(edge_index, labels, num_classes,
-                    batch_size=512, weighted_sampling=True, shuffle=False):
+                    batch_size=512, weighted_sampling=False, shuffle=True):
     """Build a DataLoader with optional WeightedRandomSampler.
 
-    weighted_sampling=True for training (combats class imbalance).
-    weighted_sampling=False for evaluation.
+    Default: shuffle=True, no weighted sampling (v2 fix — weighted sampling
+    caused focal loss over-correction in v1).
     """
     dataset = DDIPairDataset(edge_index, labels)
 
@@ -176,6 +176,19 @@ def make_dataloader(edge_index, labels, num_classes,
         return DataLoader(dataset, batch_size=batch_size, sampler=sampler)
     else:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+# ── Graph edge format conversion ──────────────────────────────────────────────
+
+def edges_to_graph_format(edge_index: torch.Tensor) -> torch.Tensor:
+    """Convert (N, 2) edge list to (2, N) format expected by GNN layers.
+
+    Input:  (N, 2) — each row is [src, dst]
+    Output: (2, N) — row 0 is all src, row 1 is all dst
+    """
+    if edge_index.dim() == 2 and edge_index.shape[1] == 2:
+        return edge_index.t().contiguous()
+    return edge_index  # already in (2, E) format
 
 
 # ── Quick sanity check ─────────────────────────────────────────────────────────

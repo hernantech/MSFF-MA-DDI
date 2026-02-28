@@ -1,23 +1,23 @@
 """
 train_drgatan.py
 ----------------
-5-fold cross-validation training loop for AsymmetricMSFF on DRGATAN.
+5-fold cross-validation training loop for AsymmetricMSFF v2 on DRGATAN.
 
-Key design choices (addressing all audit issues):
-  ✓ Model re-instantiated fresh per fold (no data leakage across folds)
-  ✓ No to_bidirection() — directed pairs preserved exactly as in dataset
-  ✓ FocalLoss (γ=2) + inverse-frequency alpha (class imbalance)
-  ✓ WeightedRandomSampler (over-samples rare types each epoch)
-  ✓ Asymmetry regularization loss
-  ✓ Early stopping with validation patience
-  ✓ Cosine annealing LR schedule (actually fires)
-  ✓ Gradient clipping for training stability
-  ✓ No Sigmoid before CE anywhere in the pipeline
+v2 changes (from Gemini discussion):
+  ✓ Graph-aware: GNN encodes ALL drugs using TRAINING edges only (no leakage)
+  ✓ CrossEntropyLoss + label_smoothing=0.1 (replaces FocalLoss that killed type-89)
+  ✓ No WeightedRandomSampler (caused over-correction with focal loss)
+  ✓ Drug embeddings computed ONCE per batch via full-graph GNN pass
+  ✓ --no-gnn flag for ablation (proves graph encoder matters)
+  ✓ --focal flag to optionally use mild focal loss (γ=0.5)
 
 Usage:
-    python train_drgatan.py [--device cuda] [--folds 5] [--epochs 200]
-                            [--batch 512] [--enc-dim 512] [--num-mv 8]
-                            [--lambda-asym 0.1] [--no-asym-reg]
+    python train_drgatan.py [--epochs 200] [--folds 5] [--batch 512]
+
+    # Ablations
+    python train_drgatan.py --no-gnn               # without graph encoder
+    python train_drgatan.py --focal --gamma 0.5     # focal loss instead of CE
+    python train_drgatan.py --no-asym-reg           # without asymmetry regularization
 """
 
 import os
@@ -26,68 +26,80 @@ import argparse
 import time
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from data_loader     import (load_drgatan, make_cv_splits, make_dataloader,
-                              compute_class_weights)
+from data_loader import (load_drgatan, make_cv_splits, make_dataloader,
+                          compute_class_weights, edges_to_graph_format)
 from model_asymmetric import build_model
-from losses           import FocalLoss, combined_loss
-from evaluate         import full_evaluation, print_metrics
+from losses import FocalLoss, combined_loss
+from evaluate import full_evaluation, print_metrics
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--device',      default='cuda' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--folds',       type=int,   default=5)
-    p.add_argument('--epochs',      type=int,   default=200)
-    p.add_argument('--batch',       type=int,   default=512)
-    p.add_argument('--patience',    type=int,   default=20,
-                   help='Early stopping patience (epochs without improvement)')
-    p.add_argument('--enc-dim',     type=int,   default=512)
-    p.add_argument('--num-mv',      type=int,   default=8,
-                   help='Number of parallel multivectors in Clifford decoder')
-    p.add_argument('--lr',          type=float, default=1e-3)
-    p.add_argument('--weight-decay',type=float, default=1e-4)
-    p.add_argument('--gamma',       type=float, default=2.0,
-                   help='Focal loss focusing parameter')
-    p.add_argument('--lambda-asym', type=float, default=0.1,
-                   help='Asymmetry regularization coefficient')
-    p.add_argument('--no-asym-reg', action='store_true',
-                   help='Disable asymmetry regularization (ablation)')
-    p.add_argument('--use-head',    action='store_true',
-                   help='Add MLP head to Clifford decoder')
-    p.add_argument('--seed',        type=int,   default=42)
-    p.add_argument('--save-dir',    default='../results/clifford_runs')
+    p.add_argument('--device',       default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--folds',        type=int,   default=5)
+    p.add_argument('--epochs',       type=int,   default=200)
+    p.add_argument('--batch',        type=int,   default=512)
+    p.add_argument('--patience',     type=int,   default=20)
+    p.add_argument('--enc-dim',      type=int,   default=512)
+    p.add_argument('--num-mv',       type=int,   default=8)
+    p.add_argument('--lr',           type=float, default=1e-3)
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--label-smooth', type=float, default=0.1,
+                   help='Label smoothing for CE loss (default 0.1)')
+    p.add_argument('--focal',        action='store_true',
+                   help='Use FocalLoss instead of CE (ablation)')
+    p.add_argument('--gamma',        type=float, default=0.5,
+                   help='Focal loss gamma (only if --focal)')
+    p.add_argument('--lambda-asym',  type=float, default=0.1)
+    p.add_argument('--no-asym-reg',  action='store_true')
+    p.add_argument('--use-head',     action='store_true')
+    p.add_argument('--no-gnn',       action='store_true',
+                   help='Disable graph encoder (ablation)')
+    p.add_argument('--gnn-heads',    type=int,   default=4)
+    p.add_argument('--gnn-layers',   type=int,   default=2)
+    p.add_argument('--seed',         type=int,   default=42)
+    p.add_argument('--save-dir',     default='../results/clifford_runs_v2')
     return p.parse_args()
 
 
 # ── Training step ──────────────────────────────────────────────────────────────
 
-def train_epoch(model, dataloader, drug_features, optimizer, focal_fn,
-                device, lambda_asym, use_asym_reg, grad_clip=1.0):
-    """One training epoch. Returns mean total/focal/asym losses."""
+def train_epoch(model, dataloader, drug_features, graph_edge_index,
+                optimizer, loss_fn, device, lambda_asym, use_asym_reg,
+                grad_clip=1.0):
+    """One training epoch with graph-aware encoding.
+
+    The GNN runs on the full graph (ALL drugs, TRAINING edges only) once per
+    batch to produce contextualized embeddings, then the decoder scores the
+    batch pairs.
+    """
     model.train()
     drug_features = drug_features.to(device)
+    graph_edge_index = graph_edge_index.to(device)
 
-    total_losses, focal_losses, asym_losses = [], [], []
+    total_losses, cls_losses, asym_losses = [], [], []
 
     for batch_edges, batch_labels in dataloader:
         batch_edges  = batch_edges.to(device)
         batch_labels = batch_labels.to(device)
 
-        # Encode all drugs, look up pair embeddings
-        drug_emb = model.encoder(drug_features)
-        h_perp   = drug_emb[batch_edges[:, 0]]
-        h_vuln   = drug_emb[batch_edges[:, 1]]
+        # Full-graph encoding (GNN sees all drugs + training edges)
+        drug_emb = model.encode(drug_features, graph_edge_index)
+
+        # Slice pair embeddings from the global embedding table
+        h_perp = drug_emb[batch_edges[:, 0]]
+        h_vuln = drug_emb[batch_edges[:, 1]]
 
         logits = model.decoder(h_perp, h_vuln)
 
-        loss, fl, ar = combined_loss(
-            focal_fn, logits, batch_labels,
+        loss, cl, ar = combined_loss(
+            loss_fn, logits, batch_labels,
             decoder=model.decoder,
             h_perp=h_perp,
             h_vuln=h_vuln,
@@ -101,31 +113,33 @@ def train_epoch(model, dataloader, drug_features, optimizer, focal_fn,
         optimizer.step()
 
         total_losses.append(loss.item())
-        focal_losses.append(fl.item())
+        cls_losses.append(cl.item())
         asym_losses.append(ar.item())
 
-    return np.mean(total_losses), np.mean(focal_losses), np.mean(asym_losses)
+    return np.mean(total_losses), np.mean(cls_losses), np.mean(asym_losses)
 
 
 # ── Validation step ────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(model, dataloader, drug_features, focal_fn, device):
-    """Compute validation loss (focal only, no reg). Returns mean loss."""
+def validate(model, dataloader, drug_features, graph_edge_index,
+             loss_fn, device):
+    """Validation loss. GNN uses TRAINING edges only (no test leakage)."""
     model.eval()
     drug_features = drug_features.to(device)
+    graph_edge_index = graph_edge_index.to(device)
 
     losses = []
     for batch_edges, batch_labels in dataloader:
         batch_edges  = batch_edges.to(device)
         batch_labels = batch_labels.to(device)
 
-        drug_emb = model.encoder(drug_features)
+        drug_emb = model.encode(drug_features, graph_edge_index)
         h_perp   = drug_emb[batch_edges[:, 0]]
         h_vuln   = drug_emb[batch_edges[:, 1]]
         logits   = model.decoder(h_perp, h_vuln)
 
-        loss = focal_fn(logits, batch_labels)
+        loss = loss_fn(logits, batch_labels)
         losses.append(loss.item())
 
     return np.mean(losses)
@@ -148,10 +162,18 @@ def main():
     print(f'  {num_drugs} drugs, {len(labels):,} pairs, {num_types} types  '
           f'({time.time()-t0:.1f}s)')
 
-    # Class weights for focal loss (computed from full dataset)
-    class_weights = compute_class_weights(labels, num_types, device=device)
-    focal_fn = FocalLoss(alpha=class_weights, gamma=args.gamma,
-                         num_classes=num_types).to(device)
+    # Loss function
+    if args.focal:
+        class_weights = compute_class_weights(labels, num_types, device=device)
+        loss_fn = FocalLoss(alpha=class_weights, gamma=args.gamma,
+                            num_classes=num_types).to(device)
+        print(f'  Loss: FocalLoss(gamma={args.gamma})')
+    else:
+        loss_fn = nn.CrossEntropyLoss(label_smoothing=args.label_smooth).to(device)
+        print(f'  Loss: CrossEntropyLoss(label_smoothing={args.label_smooth})')
+
+    print(f'  GNN: {"enabled" if not args.no_gnn else "DISABLED (ablation)"}')
+    print(f'  Asym reg: {"enabled" if not args.no_asym_reg else "disabled"}')
 
     # 5-fold stratified CV splits
     splits = make_cv_splits(edge_index, labels, n_splits=args.folds, seed=args.seed)
@@ -169,15 +191,26 @@ def main():
         test_edges   = edge_index[test_idx]
         test_labels  = labels[test_idx]
 
-        # ── Fresh model per fold (fix: no data leakage) ───────────────────────
+        # Convert training edges to (2, E) format for GNN
+        graph_edge_index = edges_to_graph_format(train_edges).to(device)
+        print(f'  Graph edges for GNN: {graph_edge_index.shape}')
+
+        # ── Fresh model per fold ───────────────────────────────────────────
         model = build_model(
             feature_dim=drug_features.shape[1],
             enc_dim=args.enc_dim,
             num_relations=num_types,
             num_mv=args.num_mv,
             use_head=args.use_head,
+            use_gnn=not args.no_gnn,
+            gnn_heads=args.gnn_heads,
+            gnn_layers=args.gnn_layers,
             device=str(device),
         )
+
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f'  Model parameters: {n_params:,}')
+
         optimizer = torch.optim.Adam(
             model.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
@@ -185,38 +218,41 @@ def main():
             optimizer, T_max=args.epochs, eta_min=1e-5
         )
 
-        # DataLoaders with WeightedRandomSampler (oversamples rare types)
+        # DataLoaders — NO weighted sampling (v2 fix)
         train_loader = make_dataloader(
             train_edges, train_labels, num_types,
-            batch_size=args.batch, weighted_sampling=True,
+            batch_size=args.batch, weighted_sampling=False, shuffle=True,
         )
-        # Use an 80/20 subset of training data as validation proxy
-        val_size  = max(len(train_idx) // 5, 1)
-        val_idx   = np.random.choice(len(train_idx), val_size, replace=False)
+        # Validation subset (20% of training data)
+        val_size = max(len(train_idx) // 5, 1)
+        val_idx  = np.random.choice(len(train_idx), val_size, replace=False)
         val_loader = make_dataloader(
             train_edges[val_idx], train_labels[val_idx], num_types,
-            batch_size=args.batch * 2, weighted_sampling=False,
+            batch_size=args.batch * 2, weighted_sampling=False, shuffle=False,
         )
 
-        # ── Training with early stopping ──────────────────────────────────────
+        # ── Training with early stopping ──────────────────────────────────
         best_val_loss  = float('inf')
         patience_count = 0
         best_state     = None
 
         for epoch in range(1, args.epochs + 1):
             t_ep = time.time()
-            train_loss, fl, ar = train_epoch(
-                model, train_loader, drug_features, optimizer, focal_fn,
-                device, args.lambda_asym,
+            train_loss, cl, ar = train_epoch(
+                model, train_loader, drug_features, graph_edge_index,
+                optimizer, loss_fn, device, args.lambda_asym,
                 use_asym_reg=not args.no_asym_reg,
             )
-            val_loss = validate(model, val_loader, drug_features, focal_fn, device)
+            val_loss = validate(
+                model, val_loader, drug_features, graph_edge_index,
+                loss_fn, device,
+            )
             scheduler.step()
 
             if epoch % 10 == 0 or epoch <= 5:
                 lr_now = optimizer.param_groups[0]['lr']
                 print(f'  Ep {epoch:3d}/{args.epochs}  '
-                      f'train={train_loss:.4f}  (fl={fl:.4f} ar={ar:.4f})  '
+                      f'train={train_loss:.4f}  (cl={cl:.4f} ar={ar:.4f})  '
                       f'val={val_loss:.4f}  lr={lr_now:.2e}  '
                       f't={time.time()-t_ep:.1f}s')
 
@@ -224,7 +260,7 @@ def main():
             if val_loss < best_val_loss:
                 best_val_loss  = val_loss
                 patience_count = 0
-                best_state     = {k: v.clone() for k, v in model.state_dict().items()}
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
             else:
                 patience_count += 1
                 if patience_count >= args.patience:
@@ -236,13 +272,14 @@ def main():
         if best_state is not None:
             model.load_state_dict(best_state)
 
-        # ── Final test evaluation ─────────────────────────────────────────────
+        # ── Final test evaluation ─────────────────────────────────────────
         print(f'\n  Evaluating on test fold...')
         metrics = full_evaluation(
             model, drug_features, test_edges, test_labels,
             train_labels=train_labels.cpu().numpy(),
             num_classes=num_types,
             device=str(device),
+            graph_edge_index=graph_edge_index,
         )
         print_metrics(metrics, prefix=f'[fold {fold+1}] ')
         fold_results.append(metrics)
@@ -258,7 +295,7 @@ def main():
         }, ckpt_path)
         print(f'  Saved checkpoint: {ckpt_path}')
 
-    # ── Aggregate across folds ────────────────────────────────────────────────
+    # ── Aggregate across folds ────────────────────────────────────────────
     print(f'\n{"="*60}')
     print(f'5-FOLD CROSS-VALIDATION SUMMARY')
     print(f'{"="*60}')
