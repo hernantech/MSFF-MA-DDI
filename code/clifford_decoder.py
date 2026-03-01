@@ -97,7 +97,12 @@ class CliffordDDIDecoder(nn.Module):
         # Learned 8-dim weights over all Clifford grades instead of scalar-only.
         # Bivector (indices 4,5,6) and pseudoscalar (index 7) carry the
         # antisymmetric directional signal that ⟨·⟩₀ discards.
-        self.grade_weights = nn.Parameter(torch.ones(8))
+        #
+        # Init: [1, 0, ..., 0] — warm-start from v2 scalar-only behavior.
+        # Optimizer learns to activate antisymmetric grades during training.
+        gw_init = torch.zeros(8)
+        gw_init[0] = 1.0
+        self.grade_weights = nn.Parameter(gw_init)
 
         # ── Clifford geometric product (stateless, just carries the matrix) ──
         self.clifford = CliffordProduct()

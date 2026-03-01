@@ -65,14 +65,14 @@ def asymmetry_regularization(
     A symmetric model (predicting the same distribution in both directions)
     is wasteful — this regularizer pushes against it.
 
-    v3 strategy: continuous -λ·KL that ALWAYS provides gradient.
+    v3 strategy: continuous bounded reward -λ·KL/(1+KL) that ALWAYS provides gradient.
     The old v2 approach used relu(margin - KL) which hit zero gradient by
     epoch 3 (margin=0.5 nats is trivially exceeded with 95 classes).
 
-    Now: reg = -λ · log(1 + KL)
+    Now: reg = -λ · KL/(1 + KL)
     This is always negative (reduces total loss when KL increases),
-    providing continuous pressure to maximize asymmetry. The log(1+KL)
-    form prevents the asymmetry term from dominating at large KL values.
+    providing continuous pressure to maximize asymmetry. The KL/(1+KL)
+    form saturates at -λ, preventing the reward from exploding at large KL.
 
     Parameters
     ----------
@@ -94,9 +94,10 @@ def asymmetry_regularization(
     # KL(P_fwd || P_rev) — measures how different the two directions are
     kl = F.kl_div(log_p_fwd, p_rev, reduction='batchmean')
 
-    # Continuous reward: -log(1 + KL) — always provides gradient
-    # Larger KL → more negative → reduces total loss → optimizer maximizes KL
-    return -lambda_asym * torch.log1p(kl)
+    # Bounded continuous reward: -KL/(1+KL) — always provides gradient
+    # Saturates at -lambda_asym, preventing explosion at large KL
+    # Gradient: -1/(1+KL)^2 → diminishing returns, stable training
+    return -lambda_asym * (kl / (1.0 + kl))
 
 
 def combined_loss(
