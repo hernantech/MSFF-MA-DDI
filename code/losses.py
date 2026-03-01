@@ -5,9 +5,11 @@ Loss functions for asymmetric DDI prediction.
 
 v2: Switched from FocalLoss (over-corrected, killed type-89) to standard
     CrossEntropyLoss with label_smoothing=0.1.
+v3: Fixed asymmetry regularization — replaced ReLU-margin (collapsed at epoch 3)
+    with continuous -λ·KL that always provides gradient pressure.
 
   FocalLoss               — kept for ablation, default γ lowered to 0.5
-  asymmetry_regularization — penalizes symmetric predictions on directed pairs
+  asymmetry_regularization — continuous KL maximization (always active)
   combined_loss           — CE + λ·asymmetry_reg
 """
 
@@ -56,17 +58,21 @@ def asymmetry_regularization(
     h_perp: torch.Tensor,
     h_vuln: torch.Tensor,
     lambda_asym: float = 0.1,
-    margin: float = 0.5,
 ) -> torch.Tensor:
-    """Penalize when the model assigns similar probabilities to (A→B) and (B→A).
+    """Encourage the model to produce different predictions for (A→B) vs (B→A).
 
     For a 100% unidirectional dataset every pair carries directional signal.
     A symmetric model (predicting the same distribution in both directions)
     is wasteful — this regularizer pushes against it.
 
-    Strategy: compute KL(P(A→B) || P(B→A)) and penalize if KL < margin.
-    We want KL to be *large* (distinct predictions), so:
-        reg = relu(margin - KL)
+    v3 strategy: continuous -λ·KL that ALWAYS provides gradient.
+    The old v2 approach used relu(margin - KL) which hit zero gradient by
+    epoch 3 (margin=0.5 nats is trivially exceeded with 95 classes).
+
+    Now: reg = -λ · log(1 + KL)
+    This is always negative (reduces total loss when KL increases),
+    providing continuous pressure to maximize asymmetry. The log(1+KL)
+    form prevents the asymmetry term from dominating at large KL values.
 
     Parameters
     ----------
@@ -74,11 +80,10 @@ def asymmetry_regularization(
     h_perp  : (B, D) perpetrator embeddings
     h_vuln  : (B, D) victim embeddings
     lambda_asym : regularization coefficient
-    margin  : minimum desired KL divergence (default 0.5 nats)
 
     Returns
     -------
-    scalar regularization loss
+    scalar regularization loss (negative = reward for asymmetry)
     """
     logits_fwd = decoder(h_perp, h_vuln)            # (B, C)
     logits_rev = decoder(h_vuln, h_perp)            # (B, C)
@@ -86,11 +91,12 @@ def asymmetry_regularization(
     log_p_fwd = F.log_softmax(logits_fwd, dim=-1)   # (B, C)
     p_rev     = F.softmax(logits_rev,    dim=-1)    # (B, C)
 
-    # KL(P_fwd || P_rev) = Σ P_fwd * log(P_fwd / P_rev)
+    # KL(P_fwd || P_rev) — measures how different the two directions are
     kl = F.kl_div(log_p_fwd, p_rev, reduction='batchmean')
 
-    # Penalize when KL is too small (model is being symmetric)
-    return lambda_asym * F.relu(margin - kl)
+    # Continuous reward: -log(1 + KL) — always provides gradient
+    # Larger KL → more negative → reduces total loss → optimizer maximizes KL
+    return -lambda_asym * torch.log1p(kl)
 
 
 def combined_loss(

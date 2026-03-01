@@ -3,17 +3,25 @@ clifford_decoder.py
 -------------------
 Asymmetric DDI decoder using Cl(3,0) geometric products.
 
-Core idea:
-    score(A→B, r) = ⟨ φ_perp(h_A) ⊙ T_r ⊙ φ_vuln(h_B) ⟩₀
+Core idea (v3 — grade-aware readout):
+    score(A→B, r) = w · (φ_perp(h_A) ⊙ T_r ⊙ φ_vuln(h_B))
 
 where φ_perp and φ_vuln are DIFFERENT learned projections (→ asymmetry),
-T_r is a learned relation-specific multivector, and ⟨·⟩₀ extracts the
-scalar (grade-0) part.
+T_r is a learned relation-specific multivector, and w is a learned 8-dim
+grade-weighting vector that reads out ALL components of the multivector.
 
-Asymmetry is structurally guaranteed:
-    score(A→B) = ⟨φ_perp(h_A) ⊙ T_r ⊙ φ_vuln(h_B)⟩₀
-    score(B→A) = ⟨φ_perp(h_B) ⊙ T_r ⊙ φ_vuln(h_A)⟩₀
-    → different because φ_perp ≠ φ_vuln (by construction)
+v3 changes (asymmetry fix):
+  ✓ Use all 8 multivector components instead of scalar-only ⟨·⟩₀
+    (the scalar part is SYMMETRIC: ⟨a⊙b⟩₀ = ⟨b⊙a⟩₀, discarding the
+     antisymmetric signal from bivectors and pseudoscalar)
+  ✓ Learned grade-weighted projection preserves non-commutative structure
+  ✓ Increased relation transform init from 0.02 → 0.1 for stronger
+    non-commutative signal from the start
+
+Asymmetry is now structurally guaranteed by:
+    1. φ_perp ≠ φ_vuln (different role projections)
+    2. Non-commutative Clifford product (a⊙t ≠ t⊙a)
+    3. Grade-aware readout preserving antisymmetric bivector/pseudoscalar
 
 Parameter efficiency:
     Relation transforms: 95 × K × 8 = 6,080 params  (K=8 multivectors)
@@ -36,7 +44,7 @@ class CliffordDDIDecoder(nn.Module):
         2. Project h_B → K multivectors via φ_vuln  (victim role)
         3. Compute triple product: (φ_perp(h_A)) ⊙ T_r ⊙ (φ_vuln(h_B))
            for each of R relation types
-        4. Extract scalar part (grade-0 component)
+        4. Grade-weighted readout over all 8 Clifford components
         5. Mean over K multivectors → per-relation logit
 
     Parameters
@@ -80,9 +88,16 @@ class CliffordDDIDecoder(nn.Module):
 
         # ── Relation-specific transforms: T_r ∈ Cl(3,0)^K ───────────────────
         # num_relations × num_mv × 8  =  95 × 8 × 8  =  6,080 params
+        # Init at 0.1 (not 0.02) for stronger non-commutative signal
         self.relation_transforms = nn.Parameter(
-            torch.randn(num_relations, num_mv, 8) * 0.02
+            torch.randn(num_relations, num_mv, 8) * 0.1
         )
+
+        # ── Grade-weighted readout (v3) ───────────────────────────────────────
+        # Learned 8-dim weights over all Clifford grades instead of scalar-only.
+        # Bivector (indices 4,5,6) and pseudoscalar (index 7) carry the
+        # antisymmetric directional signal that ⟨·⟩₀ discards.
+        self.grade_weights = nn.Parameter(torch.ones(8))
 
         # ── Clifford geometric product (stateless, just carries the matrix) ──
         self.clifford = CliffordProduct()
@@ -126,11 +141,17 @@ class CliffordDDIDecoder(nn.Module):
         # Triple product: (a ⊙ t) ⊙ b
         result = self.clifford.triple(a, t, b)  # (B*R*K, 8)
 
-        # Extract scalar part (grade-0, index 0)
-        scalars = result[:, 0].reshape(B, R, K)  # (B, R, K)
+        # Grade-weighted readout (v3): use ALL 8 components, not just scalar
+        # grade_weights learns which components matter for scoring:
+        #   indices 0     : scalar   (symmetric)
+        #   indices 1,2,3 : vectors  (mixed)
+        #   indices 4,5,6 : bivectors (ANTISYMMETRIC — directional signal)
+        #   index   7     : pseudoscalar (ANTISYMMETRIC)
+        result = result.reshape(B, R, K, 8)       # (B, R, K, 8)
+        weighted = (result * self.grade_weights).sum(dim=-1)  # (B, R, K)
 
         # Mean over K multivectors → per-relation logit
-        logits = scalars.mean(dim=-1)             # (B, R)
+        logits = weighted.mean(dim=-1)             # (B, R)
 
         return logits
 
