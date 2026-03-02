@@ -11,7 +11,7 @@ This repository contains the original MSFF-MA-DDI implementation (branch `main`)
 | Branch | Description |
 |--------|-------------|
 | `main` | Original MSFF-MA-DDI ported to PyTorch/GPU. Batched encoder (~75× speedup), fixed device placement, full pipeline runnable end-to-end. |
-| `clifford` | Asymmetric DDI extension. New dataset (DRGATAN), Clifford algebra decoder, asymmetry-specific metrics. |
+| `clifford` | Asymmetric DDI extension. DRGATAN dataset, directed GAT encoder, Clifford algebra Cl(3,0) decoder with grade-aware readout. **99.99% AUROC, 58.5% direction accuracy.** |
 
 ---
 
@@ -126,40 +126,36 @@ No type labels. Useful for encoder pretraining or binary directed link predictio
 
 ### Architecture
 
-```
-DRGATAN 2159-dim features
-        │
-        ├─→ [Feature MLP: 2159 → 512]  ─────────────┐
-        │                                            │
-        └─→ [1D-CNN pseudo-sequence: 2159 → 128]     │
-                                                     ↓
-                                         [Cross-attention fusion]
-                                                     │
-                                         512-dim drug embedding h
-                                                     │
-                            ┌────────────────────────┤
-                            ↓                        ↓
-                     φ_perp(h_A)              φ_vuln(h_B)
-                  (perpetrator role)          (victim role)
-                            │                        │
-                            └──────────┬─────────────┘
-                                       ↓
-                    score_r = ⟨ φ_perp(h_A) ⊙ T_r ⊙ φ_vuln(h_B) ⟩₀
-                                       │
-                              [95-class logits]
-                                       │
-                               [Focal Loss + asymmetry reg]
+```mermaid
+graph TD
+    A["DRGATAN 2159-dim features"] --> B["Feature MLP: 2159 → 512"]
+    A --> C["1D-CNN pseudo-sequence: 2159 → 128"]
+    B --> D["Cross-attention fusion"]
+    C --> D
+    D --> E["512-dim per-drug embedding"]
+    E --> F["DirectedGATEncoder, 2-layer<br/>(separate in/out attention,<br/>training edges only)"]
+    F --> G["512-dim graph-aware embedding h"]
+    G --> H["φ_perp(h_A)<br/>perpetrator role"]
+    G --> I["φ_vuln(h_B)<br/>victim role"]
+    H --> J["score_r = w · (φ_perp ⊙ T_r ⊙ φ_vuln)<br/>grade-aware readout, all 8 Cl(3,0) components"]
+    I --> J
+    J --> K["95-class logits"]
+    K --> L["CE + continuous asymmetry reg"]
 ```
 
-`φ_perp ≠ φ_vuln` are learned independently → `score(A→B) ≠ score(B→A)` is structurally guaranteed.
+Asymmetry is structurally guaranteed by three mechanisms:
+1. `φ_perp ≠ φ_vuln` — different learned role projections
+2. Non-commutative Clifford product: `a ⊙ t ≠ t ⊙ a`
+3. Grade-aware readout preserves antisymmetric bivector/pseudoscalar signal
 
 ### Parameter counts
 
 | Component | Params |
 |-----------|--------|
 | `DRGATANFeatureEncoder` (2159→512) | 4,308,384 |
+| `DirectedGATEncoder` (2-layer, 4-head) | 1,055,744 |
 | `CliffordDDIDecoder` (512→95, K=8) | 302,656 |
-| **Total** | **4,611,040** |
+| **Total** | **5,666,792** |
 
 For comparison:
 - Asymmetric bilinear decoder alone: ~24.9M for M_r
@@ -168,15 +164,15 @@ For comparison:
 
 ### Losses
 
-**Focal loss** (γ=2, inverse-frequency α): down-weights the dominant type-89 class (~55% of data) by up to 400× relative to rare types.
+**CrossEntropyLoss** with label_smoothing=0.1. (v1 used FocalLoss with γ=2 + inverse-freq weights + WeightedRandomSampler, which completely suppressed type-89 predictions. Kept for ablation with `--focal`.)
 
-**Asymmetry regularization**: penalizes when KL(P(A→B) ‖ P(B→A)) < 0.5 — pushes the model to make distinct predictions in each direction.
+**Continuous asymmetry regularization**: `-λ · KL/(1+KL)` where KL = KL(P(A→B) ‖ P(B→A)). Bounded reward that always provides gradient pressure toward directional differentiation. (v1/v2 used `relu(margin - KL)` with margin=0.5 which collapsed to zero gradient by epoch 3.)
 
 ### New evaluation metrics
 
 Beyond the standard 6 metrics (accuracy, micro-AUROC, micro-AUPR, macro-F1, macro-precision, macro-recall):
 
-- **Direction accuracy**: fraction of pairs where `argmax(A→B) ≠ argmax(B→A)`. A symmetric model scores 0.0. After 2 epochs (untrained): **92.3%** — Clifford structure is doing work immediately.
+- **Direction accuracy**: fraction of pairs where `argmax(A→B) ≠ argmax(B→A)`. A symmetric model scores 0.0.
 - **Asymmetry score**: mean |P(A→B) − P(B→A)|
 - **Per-type F1 by frequency**: dominant (type 89), top-4, mid-frequency (10–1000 examples), rare (<10 examples, 32 types)
 
@@ -184,12 +180,30 @@ Beyond the standard 6 metrics (accuracy, micro-AUROC, micro-AUPR, macro-F1, macr
 
 | Bug | Original | Fixed |
 |-----|----------|-------|
-| Sigmoid+CE | `Sigmoid()` before `CrossEntropyLoss` | Removed — raw logits to `FocalLoss` |
+| Sigmoid+CE | `Sigmoid()` before `CrossEntropyLoss` | Removed — raw logits to CE |
 | Data leakage | Model created once before fold loop | `build_model()` called inside each fold |
 | Dead LR scheduler | `StepLR(step_size=1500)` + never called | `CosineAnnealingLR`, actually fires |
 | Symmetric pairs | `to_bidirection()` doubles DRGATAN to ~438K edges | Not called — dataset is 100% directed |
-| Full-batch training | Entire dataset in one gradient step | `DataLoader` + `WeightedRandomSampler` |
+| Full-batch training | Entire dataset in one gradient step | `DataLoader` with shuffle |
 | No early stopping | Fixed 500 epochs | Validation patience (default 20 epochs) |
+
+### Results (5-fold CV, DRGATAN dataset)
+
+| Metric | v1 | v2 | **v3** |
+|--------|-----|-----|--------|
+| Accuracy | 14.4% | 99.53% | **99.56%** |
+| Micro-AUROC | 83.7% | 99.99% | **99.99%** |
+| Micro-AUPR | — | 99.90% | 99.84% |
+| Macro-F1 | 21.9% | 80.50% | **81.84%** |
+| F1 [dominant] | 0.000 | 99.79% | 99.80% |
+| F1 [mid-freq] | — | 93.21% | 93.68% |
+| F1 [rare <10] | — | 17.78% | **20.28%** |
+| **Direction Acc** | 85.6% | 35.83% | **58.51%** |
+| **Asymmetry Score** | — | 0.0092 | **0.0124** |
+
+- **v1**: Clifford decoder only (no GNN), FocalLoss γ=2 — over-corrected, killed type-89
+- **v2**: Added DirectedGATEncoder + CE w/ label smoothing — fixed classification, but asymmetry reg collapsed at epoch 3
+- **v3**: Grade-aware readout + continuous KL reg — asymmetry stays active, direction accuracy +22.7 points
 
 ### Running the asymmetric pipeline
 
@@ -203,37 +217,43 @@ python train_drgatan.py --epochs 200 --folds 5
 
 # Ablations
 python train_drgatan.py --no-asym-reg          # without asymmetry regularization
+python train_drgatan.py --no-gnn               # without graph encoder
+python train_drgatan.py --focal                # use FocalLoss instead of CE
 python train_drgatan.py --num-mv 4             # smaller Clifford decoder
 python train_drgatan.py --num-mv 16            # larger Clifford decoder
 python train_drgatan.py --use-head             # with MLP classification head
 
+# TensorBoard
+python train_drgatan.py --tb-dir ../logs/tensorboard --run-name my_run
+
 # Results saved to
-# results/clifford_runs/fold{N}_model.pt
-# results/clifford_runs/cv_summary.csv
+# results/clifford_v3/fold{N}_model.pt
+# results/clifford_v3/cv_summary.csv
 ```
 
 ### Baseline comparisons (DRGATAN benchmark)
 
-| Model | Year | AUROC | Key idea |
-|-------|------|-------|---------|
-| DGAT-DDI | 2022 | 98.55% | Directed GAT, source/target/self-role embeddings |
-| DRGATAN | 2024 | 98.58% | Directed relation graph attention, attacker/victim roles |
-| MGKAN | 2025 | **99.08%** | Multi-view graph + Kolmogorov-Arnold Networks |
-| ADI-MSF | 2025 | >95% | Multi-scale fusion of directed topology + drug features |
-| **This work** | 2026 | TBD | Multi-source fusion + Clifford algebra decoder |
+| Model | Year | Accuracy | AUROC | Key idea |
+|-------|------|----------|-------|---------|
+| DGAT-DDI | 2022 | 97.82% | 98.55% | Directed GAT, source/target/self-role embeddings |
+| DRGATAN | 2024 | 97.88% | 98.58% | Directed relation graph attention, attacker/victim roles |
+| MGKAN | 2025 | — | 99.08% | Multi-view graph + Kolmogorov-Arnold Networks |
+| ADI-MSF | 2025 | — | >95% | Multi-scale fusion of directed topology + drug features |
+| **This work (v3)** | 2026 | **99.56%** | **99.99%** | Multi-source fusion + DirectedGAT + Clifford Cl(3,0) decoder |
 
 ### New files (clifford branch)
 
 | File | Description |
 |------|-------------|
-| `code/clifford_algebra.py` | Cl(3,0) structure constants, batched geometric product, grade projections, verification |
-| `code/clifford_decoder.py` | `CliffordDDIDecoder` with role-specific projections and relation transforms T_r |
+| `code/clifford_algebra.py` | Cl(3,0) structure constants, batched geometric product via (64,8) matmul, grade projections |
+| `code/clifford_decoder.py` | `CliffordDDIDecoder` with role-specific projections, relation transforms T_r, grade-aware readout |
 | `code/encoder_drgatan.py` | `DRGATANFeatureEncoder` (feature MLP + 1D-CNN + cross-attention, 2159→512) |
-| `code/model_asymmetric.py` | `AsymmetricMSFF` full model, `build_model()` factory |
-| `code/losses.py` | `FocalLoss`, `asymmetry_regularization`, `combined_loss` |
-| `code/data_loader.py` | DRGATAN + ADI-MSF loading, CV splits, class weights, samplers |
+| `code/encoder_graph.py` | `DirectedGATEncoder` (2-layer directed GAT with separate in/out attention, 1.05M params) |
+| `code/model_asymmetric.py` | `AsymmetricMSFF` full pipeline: feature encoder → graph encoder → Clifford decoder |
+| `code/losses.py` | CE + continuous asymmetry regularization (`-λ·KL/(1+KL)`), FocalLoss kept for ablation |
+| `code/data_loader.py` | DRGATAN + ADI-MSF loading, CV splits, class weights, graph edge format conversion |
 | `code/evaluate.py` | Standard metrics + direction accuracy + asymmetry score + per-type F1 |
-| `code/train_drgatan.py` | 5-fold CV training loop with all fixes applied |
+| `code/train_drgatan.py` | 5-fold CV training loop with TensorBoard logging, ablation flags |
 | `datasets/DRGATAN/` | 218,917 directed pairs, 95 types, 2159-dim features |
 | `datasets/ADI-MSF/` | 504,468 binary directed pairs, MACCS/Morgan/DBP features |
 | `datasets/README.md` | Full dataset analysis (counts, distributions, asymmetry checks) |
