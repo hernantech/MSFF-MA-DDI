@@ -187,7 +187,7 @@ def prepare_data1(fold,num_cross_val):
     test_index = np.array([x for i, x in enumerate(index_pair) if i % num_cross_val == fold])
     return smiles,train_index,test_index,train_label,test_label,index_pair,label
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model = GAE(cnn_selfatte_encoder1(), DenseDecoder(320)).to(device)
+model = GAE(CnnSelfAttnEncoder(), DenseDecoder(320)).to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 num_cross_val = 5
 max_auc = 0.1
