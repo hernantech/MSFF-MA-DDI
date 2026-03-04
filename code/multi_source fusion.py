@@ -2,7 +2,9 @@ import numpy as np
 import matplotlib
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 matplotlib.use('agg')
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import f1_score
 from sklearn.metrics import recall_score
 from sklearn.metrics import precision_score
@@ -28,6 +30,42 @@ droprate = 0.5
 event_num = 65
 node_feature = 548
 
+def make_symmetric_pair(emb_i, emb_j): #Decomposes a drug pair into symmetric (in common) and asymmetric components (directionality)
+    sym  = emb_i + emb_j                 # (N, dim)
+    asym = torch.abs(emb_i - emb_j)      # (N, dim)
+    return torch.cat([sym, asym], dim=1)  # (N, dim*2)
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Standard cross entropy gives log probabilities
+        ce_loss = F.cross_entropy(
+            inputs, targets, 
+            weight=self.weight, # weight= here handles the class imbalance component
+            reduction='none'    # keep per-sample to apply focal factor
+        )
+        
+        # p_t = probability assigned to the correct class
+        # ce_loss = -log(p_t), so p_t = exp(-ce_loss)
+        p_t = torch.exp(-ce_loss)
+        
+        # Focal factor: down-weights easy examples, preserves hard ones
+        focal_factor = (1 - p_t) ** self.gamma
+        
+        focal_loss = focal_factor * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 class DNN_Stage2(torch.nn.Module):
     def __init__(self, input_dim, event_num, droprate=0.5):
         super(DNN_Stage2, self).__init__()
@@ -46,10 +84,13 @@ class DNN_Stage2(torch.nn.Module):
         return self.net(x)
 
 def train_dnn(x_train, y_train, x_val, y_val, input_dim, event_num, droprate=0.5,
-              batch_size=68, epochs=100, patience=10):
+              batch_size=68, epochs=100, patience=10, class_weights=None):
     dnn = DNN_Stage2(input_dim, event_num, droprate)
-    optimizer = torch.optim.Adam(dnn.parameters())
-    criterion = torch.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(dnn.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5
+    )
+    criterion = torch.nn.CrossEntropyLoss(weight = class_weights)
     x_train_t = torch.tensor(x_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.long)
     x_val_t = torch.tensor(x_val, dtype=torch.float32)
@@ -71,6 +112,8 @@ def train_dnn(x_train, y_train, x_val, y_val, input_dim, event_num, droprate=0.5
         with torch.no_grad():
             val_out = dnn(x_val_t)
             val_loss = criterion(val_out, y_val_t).item()
+            
+        scheduler.step(val_loss)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             wait = 0
@@ -216,7 +259,9 @@ class Encoder_decoder(torch.nn.Module):
         drug2 = index[:, 1]
         drug1_emb = embedding[drug1, :]
         drug2_emb = embedding[drug2, :]
-        drug_embedding = torch.cat((drug1_emb, drug2_emb), 1)
+        # drug_embedding = torch.cat((drug1_emb, drug2_emb), 1)
+        drug_embedding = make_symmetric_pair(drug1_emb, drug2_emb)
+        
         embedding_score = self.decoder(drug_embedding)
         return embedding_score,embedding
 def get_index(label_matrix, event_num, seed, CV):
@@ -265,7 +310,6 @@ def prepare_data1(fold,num_cross_val):
     return smiles,train_index,test_index,train_label,test_label,index_pair,label
 
 num_cross_val = 5
-max_auc = 0.1
 seed = 0
 cnn_embedding = np.loadtxt("seqbranch_embedding.txt", dtype=float, delimiter=" ")
 cnn_embedding = torch.tensor(cnn_embedding, dtype=torch.float32)
@@ -279,7 +323,27 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 embedding = embedding.to(device)
 # optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 model = Encoder_decoder().to(device)
+
+# Load full label array to compute weights from overall distribution
+label_full = np.loadtxt("../data/type572.txt", dtype=float, delimiter=" ")
+
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.arange(event_num),
+    y=label_full
+)
+class_weights_tensor = torch.tensor(
+    class_weights, dtype=torch.float32
+).to(device)
+
+# gamma=2.0 is the standard starting point.
+# If rare events (F1=0.0) still don't improve after training,
+# increase to gamma=3.0 or reduce weight= to rely more on focal factor alone.
+criterion = FocalLoss(gamma=2.0, weight=class_weights_tensor)
+
 for fold in range(5):
+    #reset for each fold
+    max_auc = 0.1
     smiles,train_index,test_index,train_label,test_label,index_pair,label= prepare_data1(fold, num_cross_val)
     train_label_t = torch.tensor(train_label, dtype=torch.long).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -292,7 +356,6 @@ for fold in range(5):
         l_pred_score = pred_score
         pred_score = pred_score.detach().cpu().numpy()
         pred_type = np.argmax(pred_score, axis=1)
-        criterion = nn.CrossEntropyLoss()
         loss = criterion(l_pred_score, train_label_t)
         loss.backward(retain_graph=True)
         optimizer.step()
@@ -362,7 +425,8 @@ for fold in range(5):
     drug2 = index_pair[:, 1]
     drug1_emb = sequ_hete_embedding[drug1, :]
     drug2_emb = sequ_hete_embedding[drug2, :]
-    drug_data = torch.cat((drug1_emb, drug2_emb), 1)
+    # drug_data = torch.cat((drug1_emb, drug2_emb), 1)
+    drug_data = (make_symmetric_pair(drug1_emb, drug2_emb))
     y_true = np.array([])
     y_pred = np.array([])
     y_score = np.zeros((0, event_num), dtype=float)
@@ -376,7 +440,7 @@ for fold in range(5):
     y_test = label[test_index]
     pred += train_dnn(x_train, y_train.astype(int), x_test, y_test.astype(int),
                       input_dim=1344, event_num=event_num, droprate=droprate,
-                      batch_size=68, epochs=100, patience=10)
+                      batch_size=68, epochs=100, patience=10, class_weights=class_weights_tensor)
     pred_score = pred
     pred_type = np.argmax(pred_score, axis=1)
     y_true = np.hstack((y_true, y_test))

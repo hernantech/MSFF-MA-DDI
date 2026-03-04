@@ -119,3 +119,15 @@ def load_csv(filename, type):  # load csv, ignore the first row,type=int, data r
                 matrix_data.append(list(map(float, row_vector[1:])))
     return np.matrix(matrix_data)
 
+class FocalLoss(torch.nn.Module):
+    def __init__(self, gamma=2.0, weight=None):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight
+
+    def forward(self, inputs, targets):
+        ce_loss = torch.nn.CrossEntropyLoss(weight=self.weight, reduction='none')(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma * ce_loss).mean()
+        return focal_loss
+

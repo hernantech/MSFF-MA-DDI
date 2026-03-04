@@ -16,10 +16,11 @@ CHARISOSMISET = {"#": 29, "%": 30, ")": 31, "(": 1, "+": 32, "-": 33, "/": 34, "
                  "V": 18, "Y": 52, "[": 53, "Z": 19, "]": 54, "\\": 20, "a": 55, "c": 56,
                  "b": 21, "e": 57, "d": 22, "g": 58, "f": 23, "i": 59, "h": 24, "m": 60,
                  "l": 25, "o": 61, "n": 26, "s": 62, "r": 27, "u": 63, "t": 28, "y": 64}
+
 def label_smiles(line, smi_ch_ind, length):
-    X = np.zeros(length,dtype=np.int64())
+    X = np.zeros(length,dtype=np.int64)
     for i, ch in enumerate(line[:length]):
-        X[i] = smi_ch_ind[ch]
+        X[i] = smi_ch_ind.get(ch, 0)       # default to padding index 0
     return X
 
 # class PositionalEncoding(nn.Module):
@@ -59,7 +60,7 @@ class cnn_selfatte_encoder1(torch.nn.Module):
         self.conv = 40
         self.CHARISOSMILEN = 64
         self.compound_max = 200
-        self.drug_MAX_LENGH = 100
+        self.drug_MAX_LENGH = 109
         self.drug_kernel = [4, 6, 8]
         self.drug_embed = nn.Embedding(65, self.dim, padding_idx=0)
         # self.pos_embedding = PositionalEncoding(64, 0)
@@ -74,8 +75,8 @@ class cnn_selfatte_encoder1(torch.nn.Module):
             nn.Conv1d(in_channels=self.conv * 2, out_channels=self.conv * 4, kernel_size=self.drug_kernel[2]),
             nn.ReLU(),
         )
-        self.Drug_max_pool = nn.MaxPool1d(
-            self.drug_MAX_LENGH - self.drug_kernel[0] - self.drug_kernel[1] - self.drug_kernel[2] + 3)
+        pool_size = self.drug_MAX_LENGH - sum(self.drug_kernel) + len(self.drug_kernel)
+        self.Drug_max_pool = nn.MaxPool1d(pool_size)
 
         self.attention = MultiHeadAttentionBlock(self.smi_dim, self.smi_dim, self.atte_dim, self.atte_heads)
 
@@ -83,14 +84,14 @@ class cnn_selfatte_encoder1(torch.nn.Module):
         device = next(self.parameters()).device
 
         # Encode all SMILES to integer indices, pad/truncate to length 100: (N, 100)
-        encoded = np.stack([label_smiles(s, CHARISOSMISET, 100) for s in output])
+        encoded = np.stack([label_smiles(s, CHARISOSMISET, self.drug_MAX_LENGH) for s in output])
         drugstr_batch = torch.from_numpy(encoded).to(device)
 
         # Embedding: (N, 100, 64)
         drug_embed = self.drug_embed(drugstr_batch)
 
         # Positional encoding: (N, 100, 64)
-        drug_embed = PositionalEncoding(64, 100, drug_embed)
+        drug_embed = PositionalEncoding(64, 100, self.drug_MAX_LENGH, drug_embed)
 
         # Self-attention: (N, 100, 64)
         drug_embed, atte = self.attention(drug_embed, drug_embed)
