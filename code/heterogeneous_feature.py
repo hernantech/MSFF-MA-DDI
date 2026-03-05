@@ -55,16 +55,17 @@ class DNN(torch.nn.Module):
 
 def train_dnn(x_train, y_train, x_val, y_val, input_dim, event_num, droprate=0.5,
               batch_size=128, epochs=100, patience=10, class_weights=None):
-    dnn = DNN(input_dim, event_num, droprate)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")                                                                         
+    dnn = DNN(input_dim, event_num, droprate).to(device)  
     optimizer = torch.optim.Adam(dnn.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5
     )
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    x_train_t = torch.tensor(x_train, dtype=torch.float32)
-    y_train_t = torch.tensor(y_train, dtype=torch.long)
-    x_val_t = torch.tensor(x_val, dtype=torch.float32)
-    y_val_t = torch.tensor(y_val, dtype=torch.long)
+    x_train_t = torch.tensor(x_train, dtype=torch.float32).to(device)
+    y_train_t = torch.tensor(y_train, dtype=torch.long).to(device)
+    x_val_t = torch.tensor(x_val, dtype=torch.float32).to(device)
+    y_val_t = torch.tensor(y_val, dtype=torch.long).to(device)
     best_val_loss = float('inf')
     wait = 0
     best_state = None
@@ -96,7 +97,7 @@ def train_dnn(x_train, y_train, x_val, y_val, input_dim, event_num, droprate=0.5
         dnn.load_state_dict(best_state)
     dnn.eval()
     with torch.no_grad():
-        pred = torch.softmax(dnn(x_val_t), dim=1).numpy()
+        pred = torch.softmax(dnn(x_val_t), dim=1).cpu().numpy()
     return pred
 
 def evaluate(pred_type, pred_score, y_test, event_num):

@@ -91,7 +91,7 @@ class cnn_selfatte_encoder1(torch.nn.Module):
         drug_embed = self.drug_embed(drugstr_batch)
 
         # Positional encoding: (N, 100, 64)
-        drug_embed = PositionalEncoding(64, 100, self.drug_MAX_LENGH, drug_embed)
+        drug_embed = PositionalEncoding(self.dim, self.drug_MAX_LENGH, drug_embed)
 
         # Self-attention: (N, 100, 64)
         drug_embed, atte = self.attention(drug_embed, drug_embed)
