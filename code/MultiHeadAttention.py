@@ -1,81 +1,127 @@
-import numpy as np
-import csv
+"""Multi-head scaled dot-product attention blocks for cross-attention between feature sources."""
+
 import torch
 from torch import nn
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 class Query(torch.nn.Module):
-    def __init__(self,input_dim,hidden_dim):
-        super(Query,self).__init__()
+    """Linear projection layer for computing attention queries."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(Query, self).__init__()
         self.hidden_dim = hidden_dim
-        self.fc = nn.Linear(input_dim,hidden_dim)
-    def forward(self,x):
-        x = self.fc(x)
-        return x
+        self.fc = nn.Linear(input_dim, hidden_dim)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 class Key(torch.nn.Module):
-    def __init__(self,input_dim,hidden_dim):
-        super(Key,self).__init__()
+    """Linear projection layer for computing attention keys."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(Key, self).__init__()
         self.hidden_dim = hidden_dim
-        self.fc = nn.Linear(input_dim,hidden_dim)
-    def forward(self,x):
-        x = self.fc(x)
-        return x
+        self.fc = nn.Linear(input_dim, hidden_dim)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 class Value(torch.nn.Module):
-    def __init__(self,input_dim,hidden_dim):
-        super(Value,self).__init__()
+    """Linear projection layer for computing attention values."""
+
+    def __init__(self, input_dim, hidden_dim):
+        super(Value, self).__init__()
         self.hidden_dim = hidden_dim
-        self.fc = nn.Linear(input_dim,hidden_dim)
-    def forward(self,x):
-        x = self.fc(x)
-        return x
+        self.fc = nn.Linear(input_dim, hidden_dim)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
 class AttentionBlock(torch.nn.Module):
-    def __init__(self,sim_dim,smi_dim,atte_dim):
-        super(AttentionBlock,self).__init__()
-        self.query = Query(sim_dim,atte_dim)
-        self.key = Key(smi_dim,atte_dim)
-        self.value = Value(smi_dim,atte_dim)
-        self.register_buffer('scale', torch.sqrt(torch.FloatTensor([atte_dim])).float())
+    """Single-head scaled dot-product attention.
+
+    Computes cross-attention where queries come from one feature source
+    and keys/values come from another.
+
+    Args:
+        query_dim: Dimensionality of the query input features.
+        key_value_dim: Dimensionality of the key/value input features.
+        attention_dim: Dimensionality of the projected query/key/value space.
+    """
+
+    def __init__(self, query_dim, key_value_dim, attention_dim):
+        super(AttentionBlock, self).__init__()
+        self.query = Query(query_dim, attention_dim)
+        self.key = Key(key_value_dim, attention_dim)
+        self.value = Value(key_value_dim, attention_dim)
+        self.register_buffer('scale', torch.sqrt(torch.FloatTensor([attention_dim])).float())
         self.dropout = nn.Dropout(p=0.5)
-    def forward(self,sim_emb,smi_emb):
-        sim_Q = self.query(sim_emb)
 
-        smi_K = self.key(smi_emb)
+    def forward(self, query_input, key_value_input):
+        """Compute scaled dot-product attention.
 
-        smi_V = self.value(smi_emb)
+        Args:
+            query_input: Tensor of query features.
+            key_value_input: Tensor of key/value features.
 
-        m = torch.matmul(sim_Q,smi_K.transpose(-2,-1)).float()
+        Returns:
+            Tuple of (attended_output, attention_weights).
+        """
+        query = self.query(query_input)
+        key = self.key(key_value_input)
+        value = self.value(key_value_input)
 
-        m = m/self.scale.float()
-        attention = torch.softmax(m, dim=-1)
-        # print(attention)
-        # print(attention.shape)
+        attention_scores = torch.matmul(query, key.transpose(-2, -1)).float()
+        attention_scores = attention_scores / self.scale.float()
+        attention_weights = torch.softmax(attention_scores, dim=-1)
 
+        attended_output = torch.matmul(attention_weights, value)
+        attended_output = self.dropout(attended_output)
 
-        smi_atte_emb = torch.matmul(attention, smi_V)
-        smi_atte_emb = self.dropout(smi_atte_emb)
+        return attended_output, attention_weights
 
-        return smi_atte_emb,attention
 
 class MultiHeadAttentionBlock(torch.nn.Module):
-    def __init__(self,sim_dim,smi_dim,atte_dim,n_heads):
-        super(MultiHeadAttentionBlock, self).__init__()
-        self.heads = []
-        for i in range(n_heads):
-            self.heads.append(AttentionBlock(sim_dim,smi_dim,atte_dim))
-        self.heads = nn.ModuleList(self.heads)
-        self.fc = nn.Linear(n_heads*atte_dim,atte_dim)
-        self.dropout = nn.Dropout(p=0.5)
-    def forward(self,sim_emb,smi_emb):
+    """Multi-head attention that runs multiple AttentionBlocks in parallel and concatenates results.
 
+    Args:
+        query_dim: Dimensionality of the query input features.
+        key_value_dim: Dimensionality of the key/value input features.
+        attention_dim: Dimensionality per attention head.
+        n_heads: Number of parallel attention heads.
+    """
+
+    def __init__(self, query_dim, key_value_dim, attention_dim, n_heads):
+        super(MultiHeadAttentionBlock, self).__init__()
+        self.heads = nn.ModuleList([
+            AttentionBlock(query_dim, key_value_dim, attention_dim)
+            for _ in range(n_heads)
+        ])
+        self.fc = nn.Linear(n_heads * attention_dim, attention_dim)
+        self.dropout = nn.Dropout(p=0.5)
+
+    def forward(self, query_input, key_value_input):
+        """Run all attention heads, concatenate outputs, and project.
+
+        Args:
+            query_input: Tensor of query features.
+            key_value_input: Tensor of key/value features.
+
+        Returns:
+            Tuple of (projected_output, averaged_attention_weights).
+        """
+        head_outputs = []
         attentions = []
-        a_emb = []
-        modular_output = []
-        for h in self.heads:
-            smi_atte_emb, attention = h(sim_emb,smi_emb)
-            # print(attention.shape)
-            a_emb.append(smi_atte_emb)
-            attentions.append(attention)
-        a_heads_emb = torch.cat(a_emb,dim=-1)
-        smile_emb = self.fc(a_heads_emb)
-        attention_ave = torch.stack(attentions).mean(dim=0)
-        # print(attention_ave[0].shape)
-        return smile_emb,attention_ave
+        for head in self.heads:
+            attended_output, attention_weights = head(query_input, key_value_input)
+            head_outputs.append(attended_output)
+            attentions.append(attention_weights)
+
+        concatenated_heads = torch.cat(head_outputs, dim=-1)
+        projected_output = self.fc(concatenated_heads)
+        averaged_attention = torch.stack(attentions).mean(dim=0)
+
+        return projected_output, averaged_attention
